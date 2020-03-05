@@ -454,6 +454,10 @@ extern void joy_libpcap_process_packet (unsigned char *ctx_index,
                                         const struct pcap_pkthdr *header,
                                         const unsigned char *packet);
 
+extern void joy_libpcap_process_raw_packet (unsigned char *ctx_index,
+                                        const struct pcap_pkthdr *header,
+                                        const unsigned char *packet);
+                                        
 /*
  * Function: joy_print_flow_data
  *

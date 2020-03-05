@@ -1376,6 +1376,38 @@ void joy_libpcap_process_packet(unsigned char *ctx_index,
     process_packet((unsigned char*)ctx, header, packet);
 }
 
+void joy_libpcap_process_raw_packet(unsigned char *ctx_index,
+                        const struct pcap_pkthdr *header,
+                        const unsigned char *packet)
+{
+    uint64_t index = 0;
+    joy_ctx_data *ctx = NULL;
+
+    /* check library initialization */
+    if (!joy_library_initialized) {
+        joy_log_crit("Joy Library has not been initialized!");
+        return;
+    }
+
+    /* make sure we have a packet to process */
+    if (packet == NULL) {
+        return;
+    }
+
+    /* ctx_index has the int value of the data context
+     * This number is between 0 and max configured contexts
+     */
+    index = (uint64_t)ctx_index;
+
+    /* sanity check the index being used */
+    if (index >= joy_num_contexts ) {
+        joy_log_crit("Joy Library invalid context (%d) for packet processing!", (uint8_t)index);
+        return;
+    }
+
+    ctx = JOY_CTX_AT_INDEX(ctx_data,index);
+    process_raw_packet((unsigned char*)ctx, header, packet);
+}
 
 /*
  * Function: joy_print_flow_data

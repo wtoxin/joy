@@ -51,6 +51,8 @@
 
 /** main packet processing entry point */
 void* process_packet(unsigned char *ctx_ptr, const struct pcap_pkthdr *header, const unsigned char *packet);
+void* process_raw_packet(unsigned char *ctx_ptr, const struct pcap_pkthdr *header, const unsigned char *packet);
+
 void libpcap_process_packet(unsigned char *ctx_ptr, const struct pcap_pkthdr *header, const unsigned char *packet);
 
 uint8_t get_packet_5tuple_key(const unsigned char *packet, flow_key_t *key);

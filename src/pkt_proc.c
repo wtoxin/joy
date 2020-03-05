@@ -1396,6 +1396,386 @@ void* process_packet (unsigned char *ctx_ptr,
     return record;
 }
 
+void* process_raw_packet (unsigned char *ctx_ptr,
+                     const struct pcap_pkthdr *pkt_header,
+                     const unsigned char *packet) {
+    flow_record_t *record = NULL;
+    bool allocated_packet_header = 0;
+    char ipv4_addr[INET_ADDRSTRLEN];
+    char ipv6_addr[INET6_ADDRSTRLEN];
+    const struct pcap_pkthdr *header =  pkt_header;
+    struct pcap_pkthdr *dyn_header = NULL;
+
+    /* declare pointers to packet headers */
+    ip_hdr_t *ip = NULL;
+    ip_hdrv6_t *ipv6 = NULL;
+    unsigned int transport_len = 0;
+    unsigned int ip_hdr_len = 0;
+    const void *transport_start = NULL;
+    flow_key_t key;
+    uint16_t ip_len = 0;
+    uint8_t ipv6_ext_hdrs = 0;
+    uint16_t tot_frame_hdr_len = 0;
+    uint8_t ip_vs = 0;
+
+    /* grab the context for this packet */
+    joy_ctx_data *ctx = (joy_ctx_data*)ctx_ptr;
+    if (ctx == NULL) {
+        joy_log_err("NULL Data Context Pointer");
+        return NULL;
+    }
+
+    memset_s(&key, sizeof(flow_key_t), 0x00, sizeof(flow_key_t));
+
+    flocap_stats_incr_num_packets(ctx);
+    joy_log_info("++++++++++ Packet %lu ++++++++++", ctx->stats.num_packets);
+    //  packet_count++;
+
+    ip = (ip_hdr_t*) packet;
+    ip_vs = ip_version(ip);
+    ctx->curr_pkt_type = 0;
+    switch(ip_vs) {
+        case 4:
+            joy_log_info("IP version - IPv4");
+            ip_hdr_len = ip_hdr_length(ip);
+            ctx->curr_pkt_type = ETH_TYPE_IP;
+            break;
+        case 6:
+            joy_log_info("IP version - IPv6");
+            ipv6 = (ip_hdrv6_t*) packet;
+            ip_hdr_len = IPV6_HDR_LENGTH;
+            ctx->curr_pkt_type = ETH_TYPE_IPV6;
+            break;
+        default:
+            return NULL;
+    }
+    
+    /* sanity check the IPv4 header */
+    if ((ctx->curr_pkt_type == ETH_TYPE_IP) && (ip_hdr_len < 20)) {
+        joy_log_err(" Invalid IP header length: %u bytes", ip_hdr_len);
+        return NULL;
+    }
+
+    /* make sure we have a valid packet header */
+    if (header == NULL) {
+        struct timeval now;
+
+        dyn_header = (struct pcap_pkthdr*) calloc(1,sizeof(struct pcap_pkthdr));
+        if (dyn_header == NULL) {
+            joy_log_err(" Couldn't allocate memory for packet header.");
+            return NULL;
+        }
+        allocated_packet_header = 1;
+        gettimeofday(&now,NULL);
+        dyn_header->ts.tv_sec = now.tv_sec;
+        dyn_header->ts.tv_usec = now.tv_usec;
+        if (ctx->curr_pkt_type == ETH_TYPE_IPV6) {
+            dyn_header->caplen = ipv6->ip_len + IPV6_HDR_LENGTH;
+            dyn_header->len = ipv6->ip_len + IPV6_HDR_LENGTH;
+        } else {
+            dyn_header->caplen = ip->ip_len;
+            dyn_header->len = ip->ip_len;
+        }
+        header = dyn_header;
+    }
+
+    if (ctx->curr_pkt_type == ETH_TYPE_IPV6) {
+        ip_len = ntohs(ipv6->ip_len) + IPV6_HDR_LENGTH;
+        if (header->caplen < IPV6_HDR_LENGTH) {
+            /*
+             * IP packet is malformed shorter than a complete IP header
+             */
+            if (allocated_packet_header)
+                free(dyn_header);
+            return NULL;
+        }
+    } else {
+        ip_len = ntohs(ip->ip_len);
+        if (ip_len < sizeof(ip_hdr_t)) {
+            /*
+             * IP packet is malformed shorter than a complete IP header
+             */
+            if (allocated_packet_header)
+                free(dyn_header);
+            return NULL;
+        }
+    }
+
+    /* check for truncated packet */
+    if (ip_len > header->caplen) {
+        /*
+         * IP packet is truncated (claims to be longer than
+         * what was capture by libpcap).
+         * This will depend on MTU and SNAPLEN; you can change
+         * the latter if need be.
+         * Let's reset the ip_len to the length of the caplen minus
+         * the ethernet header and then process the truncated packet.
+         */
+        joy_log_debug("Truncated IP packet: orig len %u , new len %u", ip_len, (header->caplen - tot_frame_hdr_len));
+        ip_len = header->caplen - tot_frame_hdr_len;
+    }
+
+    /* fill in key components */
+    if (ctx->curr_pkt_type == ETH_TYPE_IPV6) {
+        bool done = 0;
+        char *ext_hdr = NULL;
+
+        ipv6_ext_hdrs = 0;
+        memcpy_s(&key.sa.v6_sa, sizeof(uint32_t)*4, &ipv6->ip_src, sizeof(uint32_t)*4);
+        memcpy_s(&key.da.v6_da, sizeof(uint32_t)*4, &ipv6->ip_dst, sizeof(uint32_t)*4);
+
+        /* loop through IPv6 header until we find an upper layer protocol */
+        while (!done) {
+            switch (ipv6->ip_nxh) {
+                case IPPROTO_HOPOPTS:
+                case IPPROTO_ROUTING:
+                case IPPROTO_FRAGMENT:
+                case IPPROTO_ESP:
+                case IPPROTO_AH:
+                case IPPROTO_DSTOPTS:
+                    ext_hdr = (char*)ipv6 + IPV6_HDR_LENGTH + (ipv6_ext_hdrs * IPV6_EXT_HDR_LEN);
+                    ipv6->ip_nxh = *ext_hdr;
+                    ++ipv6_ext_hdrs;
+                    break;
+
+                case IPPROTO_NONE:
+                    joy_log_info("Dropping packet, no upper layer protocol found");
+                    if (allocated_packet_header) {
+                        free(dyn_header);
+                    }
+                    return NULL;
+
+                default:
+                    done = 1;
+                    key.prot = ipv6->ip_nxh;
+                    break;
+            }
+        }
+    } else {
+        if (ip_is_fragment(ip) == 0) {
+            /* fill out IP-specific fields of flow key */
+            key.sa.v4_sa = ip->ip_src;
+            key.da.v4_da = ip->ip_dst;
+            key.prot = ip->ip_prot;
+        }  else {
+            /*
+             * select IP processing, since we don't have a TCP or UDP header
+             */
+            key.sa.v4_sa = ip->ip_src;
+            key.da.v4_da = ip->ip_dst;
+            key.prot = IPPROTO_IP;
+        }
+    }
+
+    /* determine transport length and start */
+    if (ctx->curr_pkt_type == ETH_TYPE_IPV6) {
+        transport_len =  ip_len - IPV6_HDR_LENGTH;
+        transport_start = (char *)ipv6 + ip_hdr_len + (ipv6_ext_hdrs * IPV6_EXT_HDR_LEN);
+    } else {
+        transport_len =  ip_len - ip_hdr_len;
+        transport_start = (char *)ip + ip_hdr_len;
+    }
+
+    /* print source and destination IP addresses */
+    if (glb_config->verbosity != JOY_LOG_OFF && glb_config->verbosity <= JOY_LOG_INFO) { \
+        if (ctx->curr_pkt_type == ETH_TYPE_IPV6) {
+            inet_ntop(AF_INET6, &ipv6->ip_src, ipv6_addr, INET6_ADDRSTRLEN);
+            joy_log_info("Source IPv6: %s", ipv6_addr);
+            inet_ntop(AF_INET6, &ipv6->ip_dst, ipv6_addr, INET6_ADDRSTRLEN);
+            joy_log_info("Dest IP: %s", ipv6_addr);
+            joy_log_info("Len: %u", ip_len);
+            joy_log_debug("IPv6 header len: %u", (ip_hdr_len + (ipv6_ext_hdrs * 8)));
+        } else {
+            inet_ntop(AF_INET, &ip->ip_src, ipv4_addr, INET_ADDRSTRLEN);
+            joy_log_info("Source IP: %s", ipv4_addr);
+            inet_ntop(AF_INET, &ip->ip_dst, ipv4_addr, INET_ADDRSTRLEN);
+            joy_log_info("Dest IP: %s", ipv4_addr);
+            joy_log_info("Len: %u", ip_len);
+            joy_log_debug("IP header len: %u", ip_hdr_len);
+        }
+    }
+
+    /*
+     * Keep track of the most recent packet time.
+     * For all intents and purposes, this should be used as the "current" time in Joy.
+     * In addition to being usable in real-time (online) scenarios, it also works
+     * in situations where we can't use the real time, such as offline PCAP processing
+     * because the time is contextual based.
+     */
+    if (joy_timer_lt(&ctx->global_time, &header->ts)) {
+        ctx->global_time = header->ts;
+    }
+
+    /* determine transport protocol and handle appropriately */
+    switch(key.prot) {
+        case IPPROTO_TCP:
+            record = process_tcp(ctx, header, transport_start, transport_len, &key);
+            if (record) {
+                record->ip_type = ctx->curr_pkt_type;
+                update_all_tcp_features(tcp_feature_list);
+            } else {
+                /*
+                 * if record is NULL at this point, it is either a retransmission or
+                 * a malformed packet, or we couldn't create a new record. Try to find the
+                 * record. If we don't find it, then its the memory error issue and just
+                 * return at this point. If we do find it, check for retransmission flag.
+                 * If we do find it and the retransmission flag is not set, then its a
+                 * malformed packet and let it get processed as plain IP.
+                 */
+                record = flow_key_get_record(ctx, &key, DONT_CREATE_RECORDS, header);
+                if (record != NULL) {
+                    /* found record, check for retransmission flag */
+                    record->ip_type = ctx->curr_pkt_type;
+                    if (record->is_tcp_retrans == 1) {
+                        /* same packet retransmitted, just stop processing */
+	                if (allocated_packet_header) {
+		            free(dyn_header);
+	                }
+                        /* return the existing flow record */
+                        return record;
+                    } else if (record->is_tcp_retrans == 2) {
+                        /* same packet retransmitted but with additional data */
+                        /* TODO: process the additional data */
+	                if (allocated_packet_header) {
+		            free(dyn_header);
+	                }
+                        /* return the existing flow record with the new data */
+                        return record;
+                    } else {
+                        /* if we did find the flow record but retrans was not set, then
+                         * let the process_ip function below handle the packet. FALL THROUGH
+                         */
+                    }
+                } else {
+                    /* if we didn't find the flow record, then it is probably
+                     * a malformed packet and let the process_ip function below
+                     * handle the packet. FALL THROUGH
+                     */
+                }
+            }
+            break;
+        case IPPROTO_UDP:
+            record = process_udp(ctx, header, transport_start, transport_len, &key);
+            break;
+        case IPPROTO_ICMP:
+        case IPPROTO_ICMPV6:
+            record = process_icmp(ctx, header, transport_start, transport_len, &key);
+            break;
+        case IPPROTO_IP:
+        default:
+            record = process_ip(ctx, header, transport_start, transport_len, &key);
+            break;
+    }
+
+    /*
+     * if our packet is malformed TCP, UDP, or ICMP, then the process
+     * functions will return NULL; we deal with that case by treating it
+     * as just an IP packet
+     */
+    if (record == NULL) {
+        record = process_ip(ctx, header, transport_start, transport_len, &key);
+        if (record == NULL) {
+            joy_log_err("Unable to process ip packet (improper length or otherwise malformed)");
+	    if (allocated_packet_header) {
+		free(dyn_header);
+	    }
+            return NULL;
+        }
+        record->invalid = 1;
+    }
+    record->ip_type = ctx->curr_pkt_type;
+
+    /*
+     * Get IP ID
+     */
+    if (ctx->curr_pkt_type == ETH_TYPE_IPV6) {
+        /*
+         * Set minimum ttl in flow record
+         * for IPv6 we use the Hop Limit field
+         */
+        if (record->ip.ttl > ipv6->ip_hop) {
+            record->ip.ttl = ipv6->ip_hop;
+        }
+    } else {
+        if (record->ip.num_id < MAX_NUM_IP_ID) {
+            record->ip.id[record->ip.num_id] = ntohs(ip->ip_id);
+            record->ip.num_id++;
+        }
+
+        /*
+         * Set minimum ttl in flow record
+         */
+        if (record->ip.ttl > ip->ip_ttl) {
+            record->ip.ttl = ip->ip_ttl;
+        }
+    }
+
+    /* increment packet count in flow record */
+    record->np++;
+
+    /* update flow record timestamps */
+    if (timerisset(&record->start)) {
+        record->end = header->ts;
+    } else {
+        record->start = record->end = header->ts;
+    }
+
+    /*
+     * copy initial data packet, if configured to report idp, and this
+     * is the first packet in the flow with nonzero data payload
+     */
+    if ((glb_config->idp) && record->op && (record->idp_len == 0)) {
+        if (record->idp != NULL) {
+            free(record->idp);
+        }
+        record->idp_len = (ip_len < glb_config->idp ? ip_len : glb_config->idp);
+        record->idp = calloc(1, record->idp_len);
+        if (!record->idp) {
+            joy_log_err("Out of memory");
+            if (allocated_packet_header)
+                free(dyn_header);
+            return record;
+        }
+
+        /* for TCP we guard against out of order packets */
+        if (key.prot == IPPROTO_TCP) {
+            /* SYN flag processed and got the next non-zero packet */
+            if (record->idp_packet == 1) {
+                if (ctx->curr_pkt_type == ETH_TYPE_IPV6) {
+                    memcpy_s(record->idp,  record->idp_len, ipv6, record->idp_len);
+                } else {
+                    memcpy_s(record->idp,  record->idp_len, ip, record->idp_len);
+                }
+                record->idp_packet = 0;
+                joy_log_debug("Stashed %u bytes of IDP", record->idp_len);
+            } else {
+                /* not IDP packet, free up resources */
+                record->idp_len = 0;
+                free(record->idp);
+                record->idp = NULL;
+            }
+        } else {
+            if (ctx->curr_pkt_type == ETH_TYPE_IPV6) {
+                memcpy_s(record->idp, record->idp_len, ipv6, record->idp_len);
+            } else {
+                memcpy_s(record->idp, record->idp_len, ip, record->idp_len);
+            }
+            joy_log_debug("Stashed %u bytes of IDP", record->idp_len);
+        }
+    }
+
+    /* increment overall byte count */
+    flocap_stats_incr_num_bytes(ctx,transport_len);
+
+    /* set the feature ready flags for this flow record */
+    flow_record_set_feature_ready_flags(ctx,record);
+
+    /* if we allocated the packet header, then free it now */
+    if (allocated_packet_header)
+        free(dyn_header);
+    return record;
+}
+
 /**
  * \fn void libpcap_process_packet (unsigned char *ctx_ptr,
                                     const struct pcap_pkthdr *pkt_header,

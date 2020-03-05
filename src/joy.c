@@ -1835,28 +1835,50 @@ int process_pcap_file (int index, char *file_name, const char *filtr_exp, bpf_u_
         return -1;
     }
 
-    if (filtr_exp) {
+    // if (filtr_exp) {
 
-        /* compile the filter expression */
-        if (pcap_compile(handle, fp, filtr_exp, 0, *net) == -1) {
-            fprintf(stderr, "error: could not parse filter %s: %s\n",
-                    filtr_exp, pcap_geterr(handle));
-            return -2;
+    //     /* compile the filter expression */
+    //     if (pcap_compile(handle, fp, filtr_exp, 0, *net) == -1) {
+    //         fprintf(stderr, "error: could not parse filter %s: %s\n",
+    //                 filtr_exp, pcap_geterr(handle));
+    //         return -2;
+    //     }
+
+    //     /* apply the compiled filter */
+    //     if (pcap_setfilter(handle, fp) == -1) {
+    //         fprintf(stderr, "error: could not install filter %s: %s\n",
+    //                 filtr_exp, pcap_geterr(handle));
+    //         return -3;
+    //     }
+    // }
+
+    if (pcap_datalink(handle) == DLT_RAW) {
+        while (more) {
+            more = pcap_dispatch(handle, NUM_PACKETS_IN_LOOP, joy_libpcap_process_raw_packet, (unsigned char *)idx);
+            joy_print_flow_data(index, JOY_EXPIRED_FLOWS);
         }
+    } else {
+        if (filtr_exp) {
+            /* compile the filter expression */
+            if (pcap_compile(handle, fp, filtr_exp, 0, *net) == -1) {
+                fprintf(stderr, "error: could not parse filter %s: %s\n",
+                        filtr_exp, pcap_geterr(handle));
+                return -2;
+            }
 
-        /* apply the compiled filter */
-        if (pcap_setfilter(handle, fp) == -1) {
-            fprintf(stderr, "error: could not install filter %s: %s\n",
-                    filtr_exp, pcap_geterr(handle));
-            return -3;
+            /* apply the compiled filter */
+            if (pcap_setfilter(handle, fp) == -1) {
+                fprintf(stderr, "error: could not install filter %s: %s\n",
+                        filtr_exp, pcap_geterr(handle));
+                return -3;
+            }
         }
-    }
-
-    while (more) {
-        /* Loop over all packets in capture file */
-        more = pcap_dispatch(handle, NUM_PACKETS_IN_LOOP, joy_libpcap_process_packet, (unsigned char *)idx);
-        /* Print out expired flows */
-        joy_print_flow_data(index, JOY_EXPIRED_FLOWS);
+        while (more) {
+            /* Loop over all packets in capture file */
+            more = pcap_dispatch(handle, NUM_PACKETS_IN_LOOP, joy_libpcap_process_packet, (unsigned char *)idx);
+            /* Print out expired flows */
+            joy_print_flow_data(index, JOY_EXPIRED_FLOWS);
+        }
     }
 
     joy_log_info("all flows processed");
